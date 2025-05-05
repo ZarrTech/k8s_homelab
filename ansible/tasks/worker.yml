@@ -1,0 +1,35 @@
+# tasks/worker.yml
+- name: Ensure join script exists and is executable
+  block:
+    - name: Check if join script exists
+      stat:
+        path: /vagrant/ansible/join-command.sh
+      register: join_script
+
+    - name: Fail if join script is missing
+      fail:
+        msg: "Join script /vagrant/ansible/join-command.sh not found. Ensure control plane completed first."
+      when: not join_script.stat.exists
+
+    - name: Set execute permissions on join script
+      file:
+        path: /vagrant/ansible/join-command.sh
+        mode: 0700
+  when: inventory_hostname in groups['workers']
+
+- name: Join worker to Kubernetes cluster
+  command: sh /vagrant/ansible/join-command.sh
+  register: join_result
+  retries: 5
+  delay: 30
+  until: "'This node has joined the cluster' in join_result.stdout"
+  changed_when: false
+  when: inventory_hostname in groups['workers']
+
+- name: Reset kubelet if join failed previously
+  systemd:
+    name: kubelet
+    state: restarted
+  when:
+    - inventory_hostname in groups['workers']
+    - "'error' in join_result.stdout|lower"

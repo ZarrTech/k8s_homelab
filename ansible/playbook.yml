@@ -1,0 +1,41 @@
+---
+- name: Bastion setup
+  hosts: bastion
+  become: true
+  tasks:
+    - import_tasks: tasks/bastion.yml
+  # No handlers needed for bastion
+
+- name: Control node setup
+  hosts: master
+  become: true
+  tasks:
+    - import_tasks: tasks/common.yml
+    - import_tasks: tasks/control.yml
+  handlers:
+    - name: reload sysctl
+      ansible.builtin.command:
+        cmd: sysctl --system
+    
+    - name: restart docker
+      ansible.builtin.service:
+        name: docker
+        state: restarted
+        enabled: yes
+
+- name: Worker nodes setup
+  hosts: workers
+  become: true
+  tasks:
+    - import_tasks: tasks/common.yml
+    - import_tasks: tasks/worker.yml
+  handlers:
+    - name: reload sysctl
+      ansible.builtin.command:
+        cmd: sysctl --system
+    
+    - name: restart docker
+      ansible.builtin.service:
+        name: docker
+        state: restarted
+        enabled: yes

@@ -1,0 +1,47 @@
+- name: Enable IPv4 forwarding permanently
+  ansible.builtin.sysctl:
+    name: net.ipv4.ip_forward
+    value: '1'
+    state: present
+    sysctl_set: yes
+    reload: yes
+
+- name: Allow private-to-public network forwarding
+  ansible.builtin.iptables:
+    chain: FORWARD
+    in_interface: "enp0s8"
+    out_interface: "enp0s3"
+    jump: ACCEPT
+    comment: "Allow NAT traffic from private network"
+    state: present
+
+- name: Configure NAT masquerading for outbound traffic
+  ansible.builtin.iptables:
+    table: nat
+    chain: POSTROUTING
+    out_interface: "enp0s3"
+    jump: MASQUERADE
+    comment: "NAT for outbound traffic"
+    state: present
+
+- name: Install iptables persistence package
+  ansible.builtin.apt:
+    name: iptables-persistent
+    state: present
+    update_cache: yes
+
+- name: Save current iptables rules
+  ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
+  changed_when: false
+  notify: Reload iptables
+
+- name: Test NAT connectivity
+  ansible.builtin.command: ping -c 2 8.8.8.8
+  register: ping_test
+  ignore_errors: yes
+  changed_when: false
+
+- name: Display NAT test results
+  ansible.builtin.debug:
+    msg: "NAT test: {{ 'SUCCESS' if ping_test.rc == 0 else 'FAILED' }}"
+

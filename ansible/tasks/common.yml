@@ -1,0 +1,203 @@
+---
+- name: Configure default route
+  block:
+    - name: Set default route via enp0s8
+      ansible.builtin.shell: |
+        ip route replace default via 192.168.56.10 dev enp0s8
+      args:
+        warn: false
+      register: route_change
+      changed_when: route_change.rc == 0
+
+    - name: Verify route
+      ansible.builtin.command: ip route show default
+      register: route_check
+      changed_when: false
+      failed_when: "'via 192.168.56.10 dev enp0s8' not in route_check.stdout"
+
+  rescue:
+    - name: Show network config
+      debug:
+        msg: |
+          ACTUAL NETWORK CONFIG:
+            - Interface enp0s8 IP: 192.168.56.11
+            - Current default route: {{ route_check.stdout | default('Not set') }}
+            - All routes: {{ ansible_facts.routes }}
+
+    - name: Final network error
+      ansible.builtin.fail:
+        msg: |
+          Failed to set default route! Manual fixes needed:
+          1. On control node: sudo ip route replace default via 192.168.56.10 dev enp0s8
+          2. Verify with: ip route show default
+          3. Check Vagrantfile network config for enp0s8
+
+- name: Install dependencies
+  apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - software-properties-common
+      - gnupg-agent
+    state: present
+  timeout: 300
+
+- name: Add Docker GPG key (with retry)
+  apt_key:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    state: present
+    validate_certs: no
+  register: result
+  until: result is success
+  retries: 3
+  delay: 5
+
+- name: Add Docker repo
+  apt_repository:
+    repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+    state: present
+    update_cache: yes
+  when: ansible_distribution == 'Ubuntu'
+
+- name: Install Docker packages
+  apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+    state: present
+    update_cache: yes
+  timeout: 900
+  notify: restart docker
+
+- name: Ensure Docker is running
+  service:
+    name: docker
+    state: started
+    enabled: yes
+
+- name: Ensure keyring directory exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: 0755
+
+- name: Download Kubernetes GPG key (two-step process)
+  block:
+    - name: Download the key
+      ansible.builtin.get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key
+        dest: /tmp/k8s-key.gpg
+        timeout: 30
+      register: download_key
+      ignore_errors: yes
+      retries: 3
+      delay: 10
+
+    - name: Convert and install the key
+      ansible.builtin.command: >
+        gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/k8s-key.gpg
+      when: download_key is succeeded
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Clean up temp key
+      ansible.builtin.file:
+        path: /tmp/k8s-key.gpg
+        state: absent
+
+- name: Verify key was installed
+  ansible.builtin.stat:
+    path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  register: key_check
+  failed_when: key_check.stat.exists == false or key_check.stat.size < 1024
+
+- name: Add Kubernetes repository
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /"
+    state: present
+    filename: kubernetes
+    update_cache: yes
+  register: add_repo
+  until: add_repo is succeeded
+  retries: 3
+  delay: 10
+
+- name: Install Kubernetes tools
+  block:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install Kubernetes components
+      apt:
+        name:
+          - kubelet={{ k8s_version }}
+          - kubeadm={{ k8s_version }}
+          - kubectl={{ k8s_version }}
+        state: present
+      register: k8s_install
+
+    - name: Verify installed versions
+      block:
+        - name: Check kubectl version
+          command: kubectl version --client -o json
+          register: kubectl_version
+          changed_when: false
+
+        - name: Check kubeadm version
+          command: kubeadm version -o json
+          register: kubeadm_version
+          changed_when: false
+
+        - name: Check kubelet version
+          command: kubelet --version
+          register: kubelet_version
+          changed_when: false
+
+        - name: Show installed versions
+          debug:
+            msg:
+              - "kubectl: {{ (kubectl_version.stdout  | default('{}') | from_json).clientVersion.gitVersion  | default('unknown') }}"
+              - "kubeadm: {{ (kubeadm_version.stdout | default('{}') | from_json).clientVersion.gitVersion  | default('unknown') }}"
+              - "kubelet: {{ kubelet_version.stdout | default('unknown') }}"
+
+- name: Hold Kubernetes packages
+  command: apt-mark hold {{ item }}
+  loop:
+    - kubelet
+    - kubeadm
+    - kubectl
+  changed_when: false
+
+- name: Load kernel modules
+  ansible.builtin.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - overlay
+    - br_netfilter
+  notify: reload sysctl
+
+- name: Persist kernel modules across reboots
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/k8s.conf
+    mode: '0644'
+    content: |
+      overlay
+      br_netfilter
+
+
+- name: Configure sysctl
+  copy:
+    dest: /etc/sysctl.d/99-k8s.conf
+    content: |
+      net.bridge.bridge-nf-call-iptables = 1
+      net.ipv4.ip_forward = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+    mode: 0644
+  notify: reload sysctl
+
