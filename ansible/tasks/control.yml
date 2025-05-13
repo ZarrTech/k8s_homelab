@@ -1,115 +1,44 @@
-- name: Install cri-dockerd dependencies
-  apt:
-    name:
-      - curl
-      - gnupg
+- name: Load required kernel modules
+  modprobe:
+    name: "{{ item }}"
     state: present
+  loop:
+    - overlay
+    - br_netfilter
 
-- name: Add cri-dockerd repository
-  get_url:
-    url: https://download.docker.com/linux/ubuntu/gpg
-    dest: /usr/share/keyrings/docker-archive-keyring.gpg
-    mode: 0644
-
-- name: Install cri-dockerd
-  command: |
-    curl -fsSL https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.4/cri-dockerd_0.3.4.3-0.ubuntu-jammy_amd64.deb -o cri-dockerd.deb
-    dpkg -i cri-dockerd.deb
-  args:
-    creates: /usr/bin/cri-dockerd
-
-- name: Start and enable cri-docker service
+- name: Restart containerd (with built-in CRI support)
   systemd:
-    name: cri-docker
-    state: started
+    name: containerd
+    state: restarted
     enabled: yes
 
-- name: Verify cri-dockerd socket exists
-  wait_for:
-    path: /var/run/cri-dockerd.sock
-    timeout: 30
+- name: Verify CRI plugin is available
+  command: crictl info
+  register: cri_info
+  failed_when: "'unimplemented' in cri_info.stderr.lower()"
 
-- name: Pre-pull kubeadm images
-  command: kubeadm config images pull --cri-socket unix:///var/run/cri-dockerd.sock
-  register: image_pull
-  failed_when: image_pull.rc != 0
-  retries: 3
-  delay: 10
-
-- name: Verify internet access to k8s repos
-  command: curl -Is https://dl.k8s.io
-  register: k8s_connectivity
-  retries: 3
-  delay: 5
-  until: k8s_connectivity.rc == 0      
-
-- name: Initialize control plane (Docker CRI)
-  command: >-
+- name: Initialize Kubernetes cluster with containerd
+  command: >
     kubeadm init
-      --cri-socket unix:///var/run/cri-dockerd.sock
-      --apiserver-advertise-address=192.168.56.11
-      --pod-network-cidr=10.244.0.0/16
-      --ignore-preflight-errors=all  # Temporary for debugging
+    --apiserver-advertise-address=192.168.56.11
+    --pod-network-cidr=10.244.0.0/16
+    --ignore-preflight-errors=all
   args:
     creates: /etc/kubernetes/admin.conf
-  register: kubeadm_init
-  changed_when: "'Your Kubernetes control-plane has initialized' in kubeadm_init.stdout"
+  register: kubeadm_output
 
-- name: Save join command
-  when: kubeadm_init is changed
-  copy:
-    dest: /vagrant/ansible/join-command.sh
-    content: "{{ kubeadm_init.stdout | regex_search('kubeadm join.*?\\n') }}"
-    mode: '0700'
+- name: Set up kubeconfig for the default user
+  shell: |
+    mkdir -p $HOME/.kube
+    cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+    chown $(id -u):$(id -g) $HOME/.kube/config
+  args:
+    executable: /bin/bash
+  when: kubeadm_output is succeeded
 
-- name: Set up kubeconfig for vagrant user
-  when: kubeadm_init is changed
-  block:
-    - name: Create .kube directory
-      file:
-        path: /home/vagrant/.kube
-        state: directory
-        mode: '0700'
-
-    - name: Copy admin config
-      copy:
-        src: /etc/kubernetes/admin.conf
-        dest: /home/vagrant/.kube/config
-        remote_src: yes
-        owner: vagrant
-        group: vagrant
-        mode: '0600'
-
-- name: Install Flannel CNI
-  when: kubeadm_init is changed
-  command: kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+- name: Install Calico networking plugin
+  shell: |
+    kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml
   environment:
-    KUBECONFIG: /home/vagrant/.kube/config
-  register: flannel_result
-  retries: 3
-  delay: 10
-  until: flannel_result.rc == 0
-
-- name: Verify control plane status
-  block:
-    - name: Check control plane pods
-      command: kubectl get pods -n kube-system
-      register: kube_pods
-      changed_when: false
-      environment:
-        KUBECONFIG: /home/vagrant/.kube/config
-
-    - name: Show control plane status
-      debug:
-        msg: "Control plane components: {{ kube_pods.stdout }}"
-
-- name: Verify node readiness
-  command: kubectl get nodes -o jsonpath='{.items[*].status.conditions[?(@.type==\"Ready\")].status}'
-  register: node_status
-  environment:
-    KUBECONFIG: /home/vagrant/.kube/config
-  retries: 10
-  delay: 30
-  until: "'True' in node_status.stdout"
-  changed_when: false
+    KUBECONFIG: /etc/kubernetes/admin.conf
 

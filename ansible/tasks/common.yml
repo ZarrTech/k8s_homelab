@@ -4,8 +4,6 @@
     - name: Set default route via enp0s8
       ansible.builtin.shell: |
         ip route replace default via 192.168.56.10 dev enp0s8
-      args:
-        warn: false
       register: route_change
       changed_when: route_change.rc == 0
 
@@ -14,23 +12,6 @@
       register: route_check
       changed_when: false
       failed_when: "'via 192.168.56.10 dev enp0s8' not in route_check.stdout"
-
-  rescue:
-    - name: Show network config
-      debug:
-        msg: |
-          ACTUAL NETWORK CONFIG:
-            - Interface enp0s8 IP: 192.168.56.11
-            - Current default route: {{ route_check.stdout | default('Not set') }}
-            - All routes: {{ ansible_facts.routes }}
-
-    - name: Final network error
-      ansible.builtin.fail:
-        msg: |
-          Failed to set default route! Manual fixes needed:
-          1. On control node: sudo ip route replace default via 192.168.56.10 dev enp0s8
-          2. Verify with: ip route show default
-          3. Check Vagrantfile network config for enp0s8
 
 - name: Install dependencies
   apt:
@@ -60,6 +41,11 @@
     update_cache: yes
   when: ansible_distribution == 'Ubuntu'
 
+- name: Refresh apt cache
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
 - name: Install Docker packages
   apt:
     name:
@@ -68,15 +54,30 @@
       - containerd.io
       - docker-buildx-plugin
     state: present
-    update_cache: yes
   timeout: 900
-  notify: restart docker
 
-- name: Ensure Docker is running
-  service:
-    name: docker
-    state: started
+- name: Generate containerd default config
+  command: containerd config default
+  register: containerd_default_config
+
+- name: Write containerd config to disk
+  copy:
+    dest: /etc/containerd/config.toml
+    content: "{{ containerd_default_config.stdout }}"
+    mode: '0644'
+
+- name: Enable systemd cgroup driver in containerd config
+  replace:
+    path: /etc/containerd/config.toml
+    regexp: 'SystemdCgroup = false'
+    replace: 'SystemdCgroup = true'
+
+- name: Restart and enable containerd
+  systemd:
+    name: containerd
+    state: restarted
     enabled: yes
+
 
 - name: Ensure keyring directory exists
   ansible.builtin.file:

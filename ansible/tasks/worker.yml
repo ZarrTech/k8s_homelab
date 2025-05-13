@@ -1,35 +1,28 @@
-# tasks/worker.yml
-- name: Ensure join script exists and is executable
-  block:
-    - name: Check if join script exists
-      stat:
-        path: /vagrant/ansible/join-command.sh
-      register: join_script
+- name: Load required kernel modules
+  modprobe:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - overlay
+    - br_netfilter
 
-    - name: Fail if join script is missing
-      fail:
-        msg: "Join script /vagrant/ansible/join-command.sh not found. Ensure control plane completed first."
-      when: not join_script.stat.exists
-
-    - name: Set execute permissions on join script
-      file:
-        path: /vagrant/ansible/join-command.sh
-        mode: 0700
-  when: inventory_hostname in groups['workers']
-
-- name: Join worker to Kubernetes cluster
-  command: sh /vagrant/ansible/join-command.sh
-  register: join_result
-  retries: 5
-  delay: 30
-  until: "'This node has joined the cluster' in join_result.stdout"
-  changed_when: false
-  when: inventory_hostname in groups['workers']
-
-- name: Reset kubelet if join failed previously
+- name: Ensure containerd service is restarted and enabled
   systemd:
-    name: kubelet
+    name: containerd
     state: restarted
-  when:
-    - inventory_hostname in groups['workers']
-    - "'error' in join_result.stdout|lower"
+    enabled: yes
+
+- name: Verify CRI plugin is available
+  command: crictl info
+  register: cri_info
+  failed_when: "'unimplemented' in cri_info.stderr.lower()"
+
+- name: Join worker node to Kubernetes cluster
+  command: >
+    kubeadm join 192.168.56.11:6443
+    --token imczv8.bclkzx68wmiyqxfj
+    --discovery-token-ca-cert-hash sha256:be3ec6ac778072e42dad4833d7a1c08d11b7c900e8a217bfc1a1439684b20cb8
+    --ignore-preflight-errors=all
+  args:
+    creates: /etc/kubernetes/kubelet.conf
+

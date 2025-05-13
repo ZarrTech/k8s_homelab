@@ -23,6 +23,12 @@
         state: restarted
         enabled: yes
 
+    - name: Restart cri-dockerd
+      ansible.builtin.systemd:
+        name: cri-dockerd
+        state: restarted
+        become: yes      
+
 - name: Worker nodes setup
   hosts: workers
   become: true
